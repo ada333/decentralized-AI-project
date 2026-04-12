@@ -1,0 +1,6 @@
+---
+description: Decentralized AI project — architecture, conventions, and design guidance
+alwaysApply: true
+---
+
+Read and follow everything in @CLAUDE.md — it is the single source of truth for this project's architecture, conventions, design decisions, and development phases.
