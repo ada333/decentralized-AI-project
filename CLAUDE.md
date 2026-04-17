@@ -29,33 +29,52 @@ Each token generation step requires a full forward pass through the pipeline. Th
 
 ## Architecture Overview
 
+There are two distinct roles: the **Pipeline** (coordinator/client) and the **Nodes** (workers that hold model layers).
+
 ```
-┌──────────────────────────────────────────────────┐
-│                     Node                          │
-│                                                   │
-│  ┌────────────┐  ┌────────────┐  ┌────────────┐  │
-│  │ Model Shard│  │ P2P Network│  │  CLI / API  │  │
-│  │ (PyTorch)  │  │  (asyncio) │  │             │  │
-│  └─────┬──────┘  └─────┬──────┘  └──────┬─────┘  │
-│        │               │                │         │
-│        └───────┬───────┘                │         │
-│                │                        │         │
-│        ┌───────┴────────┐               │         │
-│        │   Pipeline     │◄──────────────┘         │
-│        │   Manager      │                         │
-│        │  (route        │                         │
-│        │   activations, │                         │
-│        │   manage KV$)  │                         │
-│        └───────┬────────┘                         │
-│                │                                  │
-│        ┌───────┴────────┐                         │
-│        │  Local State   │                         │
-│        │  (SQLite)      │                         │
-│        └────────────────┘                         │
-└──────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────┐
+│                       Pipeline (coordinator)                  │
+│                                                               │
+│  ┌────────────┐  ┌────────────┐  ┌──────────┐  ┌─────────┐  │
+│  │ Tokenizer  │  │  Layer     │  │ Sampling │  │  CLI /  │  │
+│  │ (encode/   │  │  Assigner  │  │ (top-k,  │  │  API    │  │
+│  │  decode)   │  │            │  │  temp)   │  │         │  │
+│  └─────┬──────┘  └─────┬──────┘  └────┬─────┘  └────┬────┘  │
+│        │               │              │              │        │
+│        └───────────────┴──────┬───────┘              │        │
+│                               │                      │        │
+│                    ┌──────────┴──────────┐            │        │
+│                    │  Generation Loop    │◄───────────┘        │
+│                    │  (drive tokens      │                     │
+│                    │   through nodes)    │                     │
+│                    └──────────┬──────────┘                     │
+│                               │                               │
+└───────────────────────────────┼───────────────────────────────┘
+                                │ network
+          ┌─────────────────────┼─────────────────────┐
+          │                     │                     │
+   ┌──────┴──────┐     ┌───────┴──────┐     ┌───────┴──────┐
+   │   Node A    │     │   Node B     │     │   Node C     │
+   │             │     │              │     │              │
+   │ embedding + │────▶│ layers 10-19 │────▶│ layers 20-29 │
+   │ layers 0-9  │     │              │     │ + LM head    │
+   │             │     │              │     │              │
+   │ [KV cache]  │     │ [KV cache]   │     │ [KV cache]   │
+   └─────────────┘     └──────────────┘     └──────────────┘
 ```
 
-Nodes form a pipeline. A client sends a prompt to the first node, activations flow through the chain, and the last node returns logits. The client (or last node) samples the token and the process repeats autoregressively.
+**Pipeline** responsibilities:
+- Holds the tokenizer — converts text → token IDs (encode) and token IDs → text (decode)
+- Owns the list of nodes and knows which layers each node has
+- Assigns layers to nodes (even split for V1, smarter strategies later)
+- Drives the generation loop: sends token IDs to Node A, receives logits from last node, samples next token, repeats
+- Nodes never see text — only token IDs (Node A) or hidden-state tensors
+
+**Node** responsibilities:
+- Holds its assigned model layers (a contiguous slice)
+- First node also holds the embedding layer, last node also holds the LM head
+- Runs forward pass on received input, sends output to next node (or back to Pipeline)
+- Maintains its own KV cache for its layers
 
 ## Tech Stack
 
@@ -156,18 +175,113 @@ Important details:
 
 ### 2. The Inference Pipeline
 
-Token generation is autoregressive — each token depends on all previous tokens. For a single token:
+Token generation is **autoregressive** — the model generates one token at a time, and each new token depends on everything before it.
 
-1. **Client** sends prompt token IDs to Node A
-2. **Node A** embeds tokens, runs through its layers, sends activations to Node B
-3. **Node B** runs through its layers, sends activations to Node C
-4. **Node C** runs through its layers + LM head, produces logits
-5. **Client** (or Node C) samples next token from logits
-6. Go to step 1 with the new token appended
+#### How a single model generates text (no network, one machine)
 
-**The KV cache problem**: Transformer attention needs key/value states from all previous tokens. Each node must maintain a KV cache for its layers. On subsequent tokens, only the new token's activations flow through the pipeline (not the full sequence), but each node updates its local KV cache.
+Say the prompt is `"The cat sat"`. Here's what happens inside a transformer:
 
-**Activation size**: For SmolLM-135M with hidden_dim=576, one token's activation is 576 float16 values = 1.15 KB. Very manageable. For a batch or long sequence prefix, multiply accordingly.
+1. **Tokenize**: `"The cat sat"` → token IDs `[464, 3797, 3332]`
+2. **Embed**: Convert token IDs into vectors (hidden states). Each token becomes a vector of 576 numbers (for SmolLM-135M). So 3 tokens → a matrix of shape `[3, 576]`.
+3. **Run through layers**: The hidden states pass through every transformer layer (30 layers in SmolLM-135M). Each layer has an **attention** step and a **feedforward** step. After all 30 layers, we have a final hidden state for each token position.
+4. **LM head**: The final hidden state of the **last** token (`sat`) gets projected to vocabulary size (e.g. 49152 for SmolLM). This gives a probability score for every possible next word. These scores are called **logits**.
+5. **Sample**: Pick the next token from those probabilities. Say it picks `on` (token ID 319).
+6. **Repeat**: Now the sequence is `"The cat sat on"`. Run step 2-5 again to get the next token, and so on.
+
+#### What is the KV cache and why does it matter?
+
+The attention mechanism in each transformer layer works like this: every token looks at every previous token to decide what's important. To do this, each token produces three things:
+- **Q (Query)**: "What am I looking for?"
+- **K (Key)**: "What do I contain?"
+- **V (Value)**: "What information do I provide if selected?"
+
+The attention score between two tokens is `Q of current token` × `K of other token`. High score means the other token is relevant. Then the output is a weighted sum of all the V vectors.
+
+**The problem with generating token-by-token**: When we generate token 4 (`on`), it needs to attend to tokens 1-3 (`The cat sat`). To compute attention, it needs the K and V vectors for all previous tokens. We have two choices:
+
+1. **No cache (wasteful)**: Re-run the entire sequence `[The, cat, sat, on]` through all layers from scratch. This recomputes the K and V for `The`, `cat`, `sat` even though they haven't changed. For each new token, work grows quadratically.
+
+2. **KV cache (smart)**: After processing `[The, cat, sat]`, save the K and V vectors from every layer. When generating the next token `on`, only run `on` through the layers. At each attention step, look up the cached K and V for the previous tokens, append the new K and V for `on`, compute attention, done. The cache grows by one entry per token per layer, but we never redo old work.
+
+```
+                        KV Cache (per layer)
+                        ┌──────────────────────────┐
+Generating "The"     →  │ K₁, V₁                   │
+Generating "cat"     →  │ K₁, V₁, K₂, V₂          │
+Generating "sat"     →  │ K₁, V₁, K₂, V₂, K₃, V₃ │
+Generating "on"      →  │ K₁...V₃, K₄, V₄         │  ← only K₄,V₄ are new
+                        └──────────────────────────┘
+Each layer has its own cache. SmolLM-135M has 30 layers → 30 separate caches.
+```
+
+#### How this works when the model is split across nodes
+
+**Key insight: nodes never see text.** The Pipeline handles all tokenization. Only Node A receives token IDs (from the Pipeline). Nodes B, C, etc. only ever see hidden-state tensors — arrays of numbers, not words.
+
+Concrete example — prompt `"The cat sat"`, 3 nodes, each with 10 layers:
+
+```
+STEP 1: Process the prompt (3 tokens at once)
+
+Pipeline (coordinator):
+  - Tokenizes "The cat sat" → [464, 3797, 3332]
+  - Sends token IDs to Node A
+
+Node A (layers 0-9 + embedding):
+  - Embeds tokens → hidden states [3, 576]
+  - Runs through layers 0-9
+  - Each layer caches K, V for all 3 tokens  ← Node A's KV cache: layers 0-9
+  - Sends output hidden states [3, 576] to Node B      (6.75 KB over network)
+
+Node B (layers 10-19):
+  - Receives hidden states [3, 576]
+  - Runs through layers 10-19
+  - Each layer caches K, V for all 3 tokens  ← Node B's KV cache: layers 10-19
+  - Sends output hidden states [3, 576] to Node C
+
+Node C (layers 20-29 + LM head):
+  - Receives hidden states [3, 576]
+  - Runs through layers 20-29
+  - Each layer caches K, V for all 3 tokens  ← Node C's KV cache: layers 20-29
+  - LM head: takes last token's hidden state → logits [49152]
+  - Sends logits back to Pipeline
+
+Pipeline:
+  - Receives logits, samples next token: "on" (ID 319)
+  - Decodes so far: "The cat sat on"
+
+
+STEP 2: Generate next token (just 1 token this time — the cache handles history)
+
+Pipeline:
+  - Sends ONLY the new token ID [319] to Node A
+
+Node A:
+  - Embeds token → hidden state [1, 576]      (just ONE token, not the whole sequence)
+  - Runs through layers 0-9
+  - Attention uses CACHED K,V for "The","cat","sat" + new K,V for "on"
+  - Appends new K, V to cache
+  - Sends output [1, 576] to Node B             (1.15 KB — much smaller than step 1)
+
+Node B:
+  - Same process with its cache for layers 10-19
+  - Sends [1, 576] to Node C
+
+Node C:
+  - Same process with its cache for layers 20-29
+  - LM head → logits
+  - Sends logits back to Pipeline
+
+Pipeline:
+  - Samples "the" (ID 262) from logits
+  - Decodes so far: "The cat sat on the"
+
+STEP 3, 4, 5...: Same as step 2. One token at a time, ~1.15 KB flowing through the pipeline each time.
+```
+
+**Who knows what**: The Pipeline is the only thing that touches text — it tokenizes the prompt and decodes the output. Node A receives token IDs and converts them to hidden states via the embedding layer. Nodes B, C, etc. never see text or token IDs — only hidden-state tensors. Each node remembers past context through its own slice of the KV cache. Sampling (picking the next token from logits) also happens in the Pipeline, not in the nodes.
+
+**Activation size**: For SmolLM-135M with hidden_dim=576, one token's hidden state is 576 float16 values = 1.15 KB. During prompt processing, multiply by the number of prompt tokens. During generation, it's always just 1.15 KB per step — very manageable even on slow networks.
 
 ### 3. Pipeline Topology
 
