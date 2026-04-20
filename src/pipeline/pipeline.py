@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from nodes.node import Node
+from node.node import Node
 
 class Pipeline:
     nodes: list[Node]
@@ -21,7 +21,7 @@ class Pipeline:
     def load_model(self, model_path: str):
         # load the model from the given path and return the layers
         # also assign the tokenizer, eos token id, embedding layer, lm head and norm layer
-        model = AutoModelForCausalLM.from_pretrained(model_path, torch_dtype=torch.float16)  # generic HuggingFace
+        model = AutoModelForCausalLM.from_pretrained(model_path, dtype=torch.float16)  # generic HuggingFace
         model.eval()                                                                         # generic PyTorch
 
         tokenizer = AutoTokenizer.from_pretrained(model_path)  # generic HuggingFace
@@ -31,6 +31,8 @@ class Pipeline:
         self._embedding = model.model.embed_tokens  # Llama-specific: in GPT-2 this would be model.transformer.wte
         self._lm_head = model.lm_head               # Llama-specific name, but most models have this at model.lm_head
         self._norm = model.model.norm                # Llama-specific: standalone RMSNorm before lm_head, not all architectures have this
+        self._rotary_emb = model.model.rotary_emb    # Llama-specific: computes rotary position embeddings (RoPE)
+        self._seq_len = 0                            # tracks total sequence length for position IDs
 
         return list(model.model.layers)              # Llama-specific: in GPT-2 this would be model.transformer.h
 
@@ -68,6 +70,15 @@ class Pipeline:
         normed = self._norm(hidden_states) # Llama specific - final layer norm applied before lm_head
         return self._lm_head(normed)
   
+    def _get_position_embeddings(self, seq_len: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """Compute rotary position embeddings (Llama-specific: RoPE)."""
+        position_ids = torch.arange(self._seq_len, self._seq_len + seq_len).unsqueeze(0)
+        hidden_size = self._embedding.embedding_dim
+        dummy = torch.zeros(1, seq_len, hidden_size, dtype=torch.float16)
+        cos, sin = self._rotary_emb(dummy, position_ids)
+        self._seq_len += seq_len
+        return cos, sin
+
     @torch.no_grad()
     def generate(self, max_new_tokens: int = 50) -> str:
         # main logic of the pipeline - assign layers, tokenize, generate the result
@@ -76,8 +87,9 @@ class Pipeline:
         token_ids = self.tokenize(self.prompt)
 
         hidden_states = self.embed(token_ids)
+        position_embeddings = self._get_position_embeddings(len(token_ids))
         for node in self.nodes:
-            hidden_states = node.forward(hidden_states)
+            hidden_states = node.forward(hidden_states, position_embeddings)
 
         logits = self.lm_head(hidden_states)
         next_token = self.sample(logits)
@@ -89,8 +101,9 @@ class Pipeline:
 
         for _ in range(max_new_tokens - 1):
             hidden_states = self.embed([next_token])
+            position_embeddings = self._get_position_embeddings(1)
             for node in self.nodes:
-                hidden_states = node.forward(hidden_states)
+                hidden_states = node.forward(hidden_states, position_embeddings)
             logits = self.lm_head(hidden_states)
             next_token = self.sample(logits)
 

@@ -1,0 +1,7 @@
+# Models
+/models/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
