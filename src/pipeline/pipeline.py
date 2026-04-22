@@ -43,10 +43,12 @@ class Pipeline:
 
         start = 0
         for node in self.nodes:
-            node.layers = list(layers[start:start + layers_per_node])
+            node.layer_start = start
+            node.layer_end = start + layers_per_node - 1
             start += layers_per_node
-
-        self.nodes[-1].layers += layers[start:]
+        
+        # the last node gets the remaining layers (remainder from division)
+        self.nodes[-1].layer_end += len(layers) - 1
     
     def tokenize(self, prompt: str) -> list[int]:
         # tokenize the given prompt into a list of token ids
