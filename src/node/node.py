@@ -1,4 +1,5 @@
 import asyncio
+import io
 import os
 import struct
 import torch
@@ -35,7 +36,7 @@ class Node:
         """
         config = AutoConfig.from_pretrained(os.path.join(self.shards_dir, "tokenizer"))
 
-        for i in range(self.layer_start, self.layer_end + 1):
+        for i in range(self.layer_start, self.layer_end):
             layer = LlamaDecoderLayer(config, layer_idx=i)
             state_dict = torch.load(
                 os.path.join(self.shards_dir, f"layer_{i}.pt"),
@@ -60,9 +61,15 @@ class Node:
         reader: asyncio.StreamReader,
         writer: asyncio.StreamWriter,
     ):
-        """Called when the Pipeline connects. Stores the reader/writer pair."""
+        """Called when the Pipeline connects. Runs a request loop."""
         self._reader = reader
         self._writer = writer
+
+        while True:
+            data = await self.receive()
+            hidden_states, position_embeddings = self._deserialize_tensors(data)
+            hidden_states = self.forward(hidden_states, position_embeddings)
+            await self.send(self._serialize_tensors(hidden_states, position_embeddings))
 
 
     async def send(self, data: bytes):
@@ -97,5 +104,20 @@ class Node:
                 past_key_values=self.kv_cache,
                 use_cache=True,
                 position_embeddings=position_embeddings,
-            )
+            )[0]
         return hidden_states
+
+    def _deserialize_tensors(self, data: bytes) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+        """Unpack hidden states and position embeddings from bytes."""
+        buffer = io.BytesIO(data)
+        return torch.load(buffer, weights_only=True)
+
+    def _serialize_tensors(
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+    ) -> bytes:
+        """Pack hidden states and position embeddings into bytes."""
+        buffer = io.BytesIO()
+        torch.save((hidden_states, position_embeddings), buffer)
+        return buffer.getvalue()
