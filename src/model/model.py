@@ -7,7 +7,11 @@ from transformers.models.llama.modeling_llama import LlamaRMSNorm, LlamaRotaryEm
 
 log = structlog.get_logger()
 class Model:
-    """Handles model-specific operations: tokenization, embedding, LM head, position embeddings."""
+    """The Pipeline's view of the model: tokenizer, embedding, LM head, and position embeddings.
+    
+    Nodes only hold transformer layers. This class holds everything else needed to
+    convert text to tokens, tokens to hidden states, and hidden states back to tokens.
+    """
 
     def __init__(self, shards_dir: str):
         self.shards_dir = shards_dir

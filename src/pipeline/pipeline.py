@@ -10,8 +10,11 @@ log = structlog.get_logger()
 
 
 class Pipeline:
-    """Orchestrates distributed inference by routing tensors through remote nodes."""
-
+    """Coordinates distributed text generation by routing hidden states through remote nodes.
+    
+    Owns the tokenizer and model head components. Drives the generation loop: tokenize prompt,
+    embed, forward through nodes, apply LM head, sample, repeat.
+    """
     def __init__(self, model: Model, nodes_addresses: list[tuple[str, int]]):
         self.model = model
         self.nodes_addresses = nodes_addresses

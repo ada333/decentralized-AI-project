@@ -11,6 +11,11 @@ import structlog
 
 
 class Node:
+    """A worker in the distributed inference pipeline.
+    
+    Holds a contiguous range of transformer layers and runs forward passes on hidden
+    states received from the Pipeline. Maintains a KV cache for its layers across tokens.
+    """
     layer_start: int
     layer_end: int
     layers: list[nn.Module]

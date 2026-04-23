@@ -84,7 +84,8 @@ There are two distinct roles: the **Pipeline** (coordinator/client) and the **No
 | ML framework | PyTorch | Transparent, imperative, easy to split models |
 | Networking | asyncio + TCP (later: QUIC/libp2p) | Start simple, upgrade when needed |
 | Serialization | MessagePack for control messages, raw bytes for tensors | Tensors are big — avoid encoding overhead |
-| Tensor transfer | Custom binary protocol (shape header + float16 blob) | Minimal overhead for activation passing |
+| Tensor transfer | Length-prefixed `torch.save` blobs | Simple, works for now; optimize later |
+| Logging | structlog | Structured logging with bound context (node_id, etc.) |
 | Local storage | SQLite via aiosqlite | Zero setup, good enough for node state |
 | CLI | Click or Typer | Clean CLI for node management |
 | Testing | pytest + pytest-asyncio | Standard, well-supported |
@@ -92,61 +93,63 @@ There are two distinct roles: the **Pipeline** (coordinator/client) and the **No
 
 ## Directory Structure
 
+Current (minimal working implementation):
+
 ```
 decentralized-AI-project/
 ├── src/
-│   ├── node/              # Node lifecycle, identity, configuration
-│   │   ├── __init__.py
+│   ├── model/             # Pipeline's model components
+│   │   └── model.py       # Model class: tokenizer, embedding, LM head, rotary emb
+│   │
+│   ├── node/              # Worker nodes
+│   │   └── node.py        # Node class: loads layers, runs forward, manages KV cache
+│   │
+│   └── pipeline/          # Coordinator
+│       └── pipeline.py    # Pipeline class: drives generation, routes tensors
+│
+├── scripts/
+│   └── split_model.py     # Split HuggingFace model into per-layer shards
+│
+├── models/                # Model shards (gitignored)
+│   └── smollm/
+│       ├── tokenizer/     # HF tokenizer files
+│       ├── pipeline_head.pt  # embed_tokens, lm_head, norm, rotary_emb
+│       ├── layer_0.pt     # Per-layer state dicts
+│       ├── layer_1.pt
+│       └── ...
+│
+├── CLAUDE.md
+└── README.md
+```
+
+Planned (future phases):
+
+```
+├── src/
+│   ├── node/
 │   │   ├── identity.py    # Keypair generation, node ID
 │   │   ├── config.py      # TOML config loading
 │   │   └── state.py       # Local SQLite state management
 │   │
 │   ├── network/           # P2P networking layer
-│   │   ├── __init__.py
 │   │   ├── transport.py   # TCP connection handling
 │   │   ├── protocol.py    # Message types and control protocol
 │   │   ├── discovery.py   # Peer discovery (bootstrap + gossip)
-│   │   ├── tensor_wire.py # Efficient tensor serialization over the wire
-│   │   └── router.py      # Message routing and dispatch
+│   │   └── tensor_wire.py # Efficient tensor serialization
 │   │
-│   ├── ml/                # Machine learning layer
-│   │   ├── __init__.py
-│   │   ├── models.py      # Model architectures (full definitions)
-│   │   ├── shard.py       # Model splitting — extract layer ranges
-│   │   ├── forward.py     # Forward pass for a shard (partial inference)
-│   │   └── kv_cache.py    # KV cache management for transformer layers
-│   │
-│   ├── pipeline/          # Distributed inference coordination
-│   │   ├── __init__.py
-│   │   ├── manager.py     # Pipeline topology — who has which layers
+│   ├── pipeline/
 │   │   ├── scheduler.py   # Request routing and load balancing
-│   │   ├── session.py     # Inference session state (tracks a generation)
+│   │   ├── session.py     # Inference session state
 │   │   └── sampler.py     # Token sampling (temperature, top-k, top-p)
 │   │
-│   ├── security/          # Security
-│   │   ├── __init__.py
-│   │   ├── crypto.py      # Encryption, signing, key management
-│   │   └── trust.py       # Peer reputation and trust scoring
-│   │
-│   └── cli/               # Command-line interface
-│       ├── __init__.py
-│       └── main.py        # CLI commands (start, stop, status, peers, generate)
+│   └── cli/
+│       └── main.py        # CLI commands
 │
 ├── tests/
-│   ├── test_network/
-│   ├── test_ml/
-│   ├── test_pipeline/
-│   └── conftest.py        # Shared fixtures (mock nodes, test pipelines)
+│   └── conftest.py        # Shared fixtures
 │
-├── configs/
-│   └── default.toml       # Default node configuration
-│
-├── scripts/
-│   ├── run_local_cluster.py   # Spin up N nodes locally for testing
-│   └── split_model.py        # Pre-split a model into shards for nodes
-│
-├── pyproject.toml
-└── README.md
+└── configs/
+    └── default.toml       # Default node configuration
 ```
 
 ## Core Components — Design Notes
@@ -426,21 +429,22 @@ Not all nodes are equal. A Raspberry Pi and a gaming PC shouldn't get the same n
 ## Development Phases
 
 ### Phase 1 — Foundation
-- [ ] Project scaffolding (pyproject.toml, src layout, basic CLI)
+- [x] Project scaffolding (pyproject.toml, src layout, basic CLI)
 - [ ] Node identity (keypair gen, node ID derivation)
-- [ ] Load a small model (SmolLM-135M from HuggingFace, or TinyLlama-1.1B)
-- [ ] Model sharding: split a model into N contiguous layer ranges, save/load independently
-- [ ] Single-node inference: generate tokens locally as a baseline
+- [x] Load a small model (SmolLM-135M from HuggingFace, or TinyLlama-1.1B)
+- [x] Model sharding: split a model into N contiguous layer ranges, save/load independently
+- [x] Single-node inference: generate tokens locally as a baseline
 
 ### Phase 2 — Two-Node Pipeline
-- [ ] Basic TCP transport (connect, send, receive between two nodes)
-- [ ] Tensor wire protocol (serialize/deserialize activations efficiently)
-- [ ] Two-node pipeline: Node A (embedding + first layers) → Node B (last layers + LM head)
-- [ ] KV cache: each node maintains cache for its layers across tokens
-- [ ] End-to-end: send a prompt, get generated text back through the pipeline
+- [x] Basic TCP transport (connect, send, receive between two nodes)
+- [x] Tensor wire protocol (serialize/deserialize activations efficiently)
+- [x] Two-node pipeline: Node A (embedding + first layers) → Node B (last layers + LM head)
+- [x] KV cache: each node maintains cache for its layers across tokens
+- [x] End-to-end: send a prompt, get generated text back through the pipeline
+- [x] Structured logging with structlog
 
 ### Phase 3 — Multi-Node & Discovery
-- [ ] Generalize to N-node pipeline
+- [x] Generalize to N-node pipeline
 - [ ] Peer discovery (bootstrap list → gossip with layer advertisements)
 - [ ] Pipeline negotiation (nodes agree on who has which layers)
 - [ ] Multiple concurrent inference sessions
