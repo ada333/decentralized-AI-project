@@ -1,6 +1,9 @@
 # Models
 /models/
 
+# Configs
+configs/
+
 # Python
 __pycache__/
 *.pyc

@@ -96,7 +96,7 @@ class Pipeline:
         """Compute rotary position embeddings (Llama-specific: RoPE)."""
         position_ids = torch.arange(self._seq_len, self._seq_len + seq_len).unsqueeze(0)
         hidden_size = self._embedding.embedding_dim
-        dummy = torch.zeros(1, seq_len, hidden_size, dtype=torch.float16)
+        dummy = torch.zeros(1, seq_len, hidden_size, dtype=torch.float32)
         cos, sin = self._rotary_emb(dummy, position_ids)
         self._seq_len += seq_len
         return cos, sin

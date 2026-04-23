@@ -35,9 +35,11 @@ class Node:
         an empty LlamaDecoderLayer, load the weights, and set it to eval mode.
         """
         config = AutoConfig.from_pretrained(os.path.join(self.shards_dir, "tokenizer"))
+        config._attn_implementation = "sdpa"  # Match the model's attention implementation
 
         for i in range(self.layer_start, self.layer_end):
-            layer = LlamaDecoderLayer(config, layer_idx=i)
+            local_idx = i - self.layer_start  # Use local index for KV cache
+            layer = LlamaDecoderLayer(config, layer_idx=local_idx)
             state_dict = torch.load(
                 os.path.join(self.shards_dir, f"layer_{i}.pt"),
                 weights_only=True,
@@ -64,12 +66,20 @@ class Node:
         """Called when the Pipeline connects. Runs a request loop."""
         self._reader = reader
         self._writer = writer
+        self.kv_cache = DynamicCache()  # Reset cache for new session
 
-        while True:
-            data = await self.receive()
-            hidden_states, position_embeddings = self._deserialize_tensors(data)
-            hidden_states = self.forward(hidden_states, position_embeddings)
-            await self.send(self._serialize_tensors(hidden_states, position_embeddings))
+        try:
+            while True:
+                data = await self.receive()
+                hidden_states, position_embeddings = self._deserialize_tensors(data)
+                hidden_states = self.forward(hidden_states, position_embeddings)
+                await self.send(self._serialize_tensors(hidden_states, position_embeddings))
+        except asyncio.IncompleteReadError:
+            # Normal case: pipeline closed the socket after finishing generation.
+            pass
+        finally:
+            writer.close()
+            await writer.wait_closed()
 
 
     async def send(self, data: bytes):
@@ -99,12 +109,16 @@ class Node:
             self.load_layers()
 
         for layer in self.layers:
-            hidden_states = layer(
+            layer_output = layer(
                 hidden_states,
                 past_key_values=self.kv_cache,
                 use_cache=True,
                 position_embeddings=position_embeddings,
-            )[0]
+            )
+            # HF layer return type can vary by version:
+            # - torch.Tensor
+            # - tuple where index 0 is hidden_states
+            hidden_states = layer_output[0] if isinstance(layer_output, tuple) else layer_output
         return hidden_states
 
     def _deserialize_tensors(self, data: bytes) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
