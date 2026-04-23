@@ -2,8 +2,11 @@ import asyncio
 import io
 import struct
 import torch
+import structlog
 
 from model.model import Model
+
+log = structlog.get_logger()
 
 
 class Pipeline:
@@ -16,12 +19,20 @@ class Pipeline:
 
     async def _connect_to_nodes(self):
         """Open a TCP connection to each node."""
+        log.info("connecting_to_nodes", count=len(self.nodes_addresses))
         for host, port in self.nodes_addresses:
-            reader, writer = await asyncio.open_connection(host, port)
+            try:
+                reader, writer = await asyncio.open_connection(host, port)
+            except OSError as e:
+                log.error("node_connection_failed", host=host, port=port, error=str(e))
+                raise
             self._connections.append((reader, writer))
+            log.debug("node_connected", host=host, port=port)
+        log.info("all_nodes_connected")
 
     async def _close_connections(self):
         """Close all TCP connections."""
+        log.info("closing_connections", count=len(self._connections))
         for _, writer in self._connections:
             writer.close()
             await writer.wait_closed()
@@ -33,13 +44,16 @@ class Pipeline:
         header = struct.pack(">I", len(data))
         writer.write(header + data)
         await writer.drain()
+        log.debug("sent_to_node", node_index=node_index, bytes=len(data))
 
     async def _receive(self, node_index: int) -> bytes:
         """Receive length-prefixed data from a node."""
         reader, _ = self._connections[node_index]
         header = await reader.readexactly(4)
         length = struct.unpack(">I", header)[0]
-        return await reader.readexactly(length)
+        data = await reader.readexactly(length)
+        log.debug("received_from_node", node_index=node_index, bytes=length)
+        return data
 
     def _serialize_tensors(
         self,
@@ -67,8 +81,12 @@ class Pipeline:
         data = self._serialize_tensors(hidden_states, position_embeddings)
 
         for i in range(len(self.nodes_addresses)):
-            await self._send(i, data)
-            data = await self._receive(i)
+            try:
+                await self._send(i, data)
+                data = await self._receive(i)
+            except (OSError, asyncio.IncompleteReadError) as e:
+                log.error("node_communication_failed", node_index=i, error=str(e))
+                raise
 
         hidden_states, _ = self._deserialize_tensors(data)
         return hidden_states
@@ -86,14 +104,17 @@ class Pipeline:
     @torch.no_grad()
     async def generate(self, prompt: str, max_new_tokens: int = 50) -> str:
         """Generate text for a single prompt by distributing inference across nodes."""
+        log.info("generation_start", prompt_length=len(prompt), max_new_tokens=max_new_tokens)
         self.model.reset_position()
         await self._connect_to_nodes()
 
         try:
             token_ids = self.model.tokenize(prompt)
+            log.debug("prompt_tokenized", num_tokens=len(token_ids))
             next_token = await self._generate_next_token(token_ids)
 
             if next_token == self.model.eos_token_id:
+                log.info("generation_complete", tokens_generated=0, reason="eos_immediate")
                 return ""
 
             generated = [next_token]
@@ -106,7 +127,11 @@ class Pipeline:
 
                 generated.append(next_token)
 
+            log.info("generation_complete", tokens_generated=len(generated))
             return self.model.detokenize(generated)
 
+        except Exception as e:
+            log.error("generation_failed", error=str(e), exc_info=True)
+            raise
         finally:
             await self._close_connections()

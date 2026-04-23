@@ -7,6 +7,7 @@ import torch.nn as nn
 from transformers import AutoConfig
 from transformers.models.llama.modeling_llama import LlamaDecoderLayer
 from transformers.cache_utils import DynamicCache
+import structlog
 
 
 class Node:
@@ -27,6 +28,10 @@ class Node:
         self.port = port
         self._reader: asyncio.StreamReader | None = None
         self._writer: asyncio.StreamWriter | None = None
+        self.log = structlog.get_logger().bind(
+            node_id=f"{host}:{port}",
+            layers=f"{layer_start}-{layer_end}",
+        )
 
     def load_layers(self):
         """Load this node's layer range from individual shard files.
@@ -34,26 +39,44 @@ class Node:
         Each layer_X.pt contains a state_dict (weights only), so we create
         an empty LlamaDecoderLayer, load the weights, and set it to eval mode.
         """
-        config = AutoConfig.from_pretrained(os.path.join(self.shards_dir, "tokenizer"))
+        self.log.info("loading_layers", shards_dir=self.shards_dir)
+        try:
+            config = AutoConfig.from_pretrained(os.path.join(self.shards_dir, "tokenizer"))
+        except Exception as e:
+            self.log.error("config_load_failed", shards_dir=self.shards_dir, error=str(e))
+            raise
         config._attn_implementation = "sdpa"  # Match the model's attention implementation
 
         for i in range(self.layer_start, self.layer_end):
             local_idx = i - self.layer_start  # Use local index for KV cache
             layer = LlamaDecoderLayer(config, layer_idx=local_idx)
-            state_dict = torch.load(
-                os.path.join(self.shards_dir, f"layer_{i}.pt"),
-                weights_only=True,
-            )
+            layer_path = os.path.join(self.shards_dir, f"layer_{i}.pt")
+            try:
+                state_dict = torch.load(layer_path, weights_only=True)
+            except FileNotFoundError:
+                self.log.error("layer_file_not_found", layer_idx=i, path=layer_path)
+                raise
+            except Exception as e:
+                self.log.error("layer_load_failed", layer_idx=i, path=layer_path, error=str(e))
+                raise
             layer.load_state_dict(state_dict)
             layer.eval()
             self.layers.append(layer)
+            self.log.debug("layer_loaded", layer_idx=i)
+        self.log.info("layers_loaded", count=len(self.layers))
 
 
     async def start(self):
         """Start TCP server and listen for a connection from the Pipeline."""
-        server = await asyncio.start_server(
-            self._on_connect, self.host, self.port,
-        )
+        self.log.info("server_starting")
+        try:
+            server = await asyncio.start_server(
+                self._on_connect, self.host, self.port,
+            )
+        except OSError as e:
+            self.log.error("server_bind_failed", error=str(e))
+            raise
+        self.log.info("server_listening")
         async with server:
             await server.serve_forever()
 
@@ -64,19 +87,24 @@ class Node:
         writer: asyncio.StreamWriter,
     ):
         """Called when the Pipeline connects. Runs a request loop."""
+        peer = writer.get_extra_info("peername")
+        self.log.info("client_connected", peer=peer)
         self._reader = reader
         self._writer = writer
         self.kv_cache = DynamicCache()  # Reset cache for new session
-
+        
         try:
             while True:
                 data = await self.receive()
                 hidden_states, position_embeddings = self._deserialize_tensors(data)
+                self.log.debug("forward_start", input_shape=list(hidden_states.shape))
                 hidden_states = self.forward(hidden_states, position_embeddings)
+                self.log.debug("forward_done", output_shape=list(hidden_states.shape))
                 await self.send(self._serialize_tensors(hidden_states, position_embeddings))
         except asyncio.IncompleteReadError:
-            # Normal case: pipeline closed the socket after finishing generation.
-            pass
+            self.log.info("client_disconnected", peer=peer)
+        except Exception as e:
+            self.log.error("request_handling_failed", peer=peer, error=str(e), exc_info=True)
         finally:
             writer.close()
             await writer.wait_closed()
@@ -89,7 +117,7 @@ class Node:
         header = struct.pack(">I", len(data))
         self._writer.write(header + data)
         await self._writer.drain()
-
+        self.log.debug("sent", bytes=len(data))
 
     async def receive(self) -> bytes:
         """Receive length-prefixed data from the Pipeline."""
@@ -97,7 +125,9 @@ class Node:
         # and contains the length of the data
         header = await self._reader.readexactly(4)
         length = struct.unpack(">I", header)[0]
-        return await self._reader.readexactly(length)
+        data = await self._reader.readexactly(length)
+        self.log.debug("received", bytes=length)
+        return data
 
 
     def forward(
