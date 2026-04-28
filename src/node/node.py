@@ -1,13 +1,13 @@
 import asyncio
-import io
 import os
-import struct
 import torch
 import torch.nn as nn
 from transformers import AutoConfig
 from transformers.models.llama.modeling_llama import LlamaDecoderLayer
 from transformers.cache_utils import DynamicCache
 import structlog
+
+from network.tensor_wire import serialize_tensors, deserialize_tensors, send_message, receive_message
 
 
 class Node:
@@ -31,8 +31,6 @@ class Node:
         self.kv_cache = DynamicCache()
         self.host = host
         self.port = port
-        self._reader: asyncio.StreamReader | None = None
-        self._writer: asyncio.StreamWriter | None = None
         self.log = structlog.get_logger().bind(
             node_id=f"{host}:{port}",
             layers=f"{layer_start}-{layer_end}",
@@ -74,6 +72,7 @@ class Node:
     async def start(self):
         """Start TCP server and listen for a connection from the Pipeline."""
         self.log.info("server_starting")
+        self.load_layers()
         try:
             server = await asyncio.start_server(
                 self._on_connect, self.host, self.port,
@@ -94,18 +93,16 @@ class Node:
         """Called when the Pipeline connects. Runs a request loop."""
         peer = writer.get_extra_info("peername")
         self.log.info("client_connected", peer=peer)
-        self._reader = reader
-        self._writer = writer
         self.kv_cache = DynamicCache()  # Reset cache for new session
         
         try:
             while True:
-                data = await self.receive()
-                hidden_states, position_embeddings = self._deserialize_tensors(data)
+                data = await receive_message(reader)
+                hidden_states, position_embeddings = deserialize_tensors(data)
                 self.log.debug("forward_start", input_shape=list(hidden_states.shape))
                 hidden_states = self.forward(hidden_states, position_embeddings)
                 self.log.debug("forward_done", output_shape=list(hidden_states.shape))
-                await self.send(self._serialize_tensors(hidden_states, position_embeddings))
+                await send_message(writer, serialize_tensors(hidden_states, position_embeddings))
         except asyncio.IncompleteReadError:
             self.log.info("client_disconnected", peer=peer)
         except Exception as e:
@@ -115,34 +112,12 @@ class Node:
             await writer.wait_closed()
 
 
-    async def send(self, data: bytes):
-        """Send length-prefixed data back to the Pipeline."""
-        # header is 4 bytes long and contains the length of the data
-        # >I means big endian unsigned int
-        header = struct.pack(">I", len(data))
-        self._writer.write(header + data)
-        await self._writer.drain()
-        self.log.debug("sent", bytes=len(data))
-
-    async def receive(self) -> bytes:
-        """Receive length-prefixed data from the Pipeline."""
-        # read the header first which we presume to be 4 bytes long 
-        # and contains the length of the data
-        header = await self._reader.readexactly(4)
-        length = struct.unpack(">I", header)[0]
-        data = await self._reader.readexactly(length)
-        self.log.debug("received", bytes=length)
-        return data
-
-
     def forward(
         self,
         hidden_states: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
     ) -> torch.Tensor:
-        if not self.layers:
-            self.load_layers()
-
+        """Forward pass through this node's layers."""
         for layer in self.layers:
             layer_output = layer(
                 hidden_states,
@@ -155,18 +130,3 @@ class Node:
             # - tuple where index 0 is hidden_states
             hidden_states = layer_output[0] if isinstance(layer_output, tuple) else layer_output
         return hidden_states
-
-    def _deserialize_tensors(self, data: bytes) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
-        """Unpack hidden states and position embeddings from bytes."""
-        buffer = io.BytesIO(data)
-        return torch.load(buffer, weights_only=True)
-
-    def _serialize_tensors(
-        self,
-        hidden_states: torch.Tensor,
-        position_embeddings: tuple[torch.Tensor, torch.Tensor],
-    ) -> bytes:
-        """Pack hidden states and position embeddings into bytes."""
-        buffer = io.BytesIO()
-        torch.save((hidden_states, position_embeddings), buffer)
-        return buffer.getvalue()

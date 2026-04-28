@@ -1,10 +1,9 @@
 import asyncio
-import io
-import struct
 import torch
 import structlog
 
 from model.model import Model
+from network.tensor_wire import serialize_tensors, deserialize_tensors, send_message, receive_message
 
 log = structlog.get_logger()
 
@@ -41,57 +40,23 @@ class Pipeline:
             await writer.wait_closed()
         self._connections = []
 
-    async def _send(self, node_index: int, data: bytes):
-        """Send length-prefixed data to a node."""
-        _, writer = self._connections[node_index]
-        header = struct.pack(">I", len(data))
-        writer.write(header + data)
-        await writer.drain()
-        log.debug("sent_to_node", node_index=node_index, bytes=len(data))
-
-    async def _receive(self, node_index: int) -> bytes:
-        """Receive length-prefixed data from a node."""
-        reader, _ = self._connections[node_index]
-        header = await reader.readexactly(4)
-        length = struct.unpack(">I", header)[0]
-        data = await reader.readexactly(length)
-        log.debug("received_from_node", node_index=node_index, bytes=length)
-        return data
-
-    def _serialize_tensors(
-        self,
-        hidden_states: torch.Tensor,
-        position_embeddings: tuple[torch.Tensor, torch.Tensor],
-    ) -> bytes:
-        """Pack hidden states and position embeddings into bytes."""
-        buffer = io.BytesIO()
-        torch.save((hidden_states, position_embeddings), buffer)
-        return buffer.getvalue()
-
-    def _deserialize_tensors(
-        self, data: bytes
-    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
-        """Unpack hidden states and position embeddings from bytes."""
-        buffer = io.BytesIO(data)
-        return torch.load(buffer, weights_only=True)
-
     async def _forward_through_nodes(
         self,
         hidden_states: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
     ) -> torch.Tensor:
         """Send hidden states through all nodes and return the final output."""
-        data = self._serialize_tensors(hidden_states, position_embeddings)
+        data = serialize_tensors(hidden_states, position_embeddings)
 
-        for i in range(len(self.nodes_addresses)):
+        for i, (reader, writer) in enumerate(self._connections):
             try:
-                await self._send(i, data)
-                data = await self._receive(i)
+                await send_message(writer, data)
+                data = await receive_message(reader)
             except (OSError, asyncio.IncompleteReadError) as e:
                 log.error("node_communication_failed", node_index=i, error=str(e))
                 raise
 
-        hidden_states, _ = self._deserialize_tensors(data)
+        hidden_states, _ = deserialize_tensors(data)
         return hidden_states
 
     async def _generate_next_token(self, token_ids: list[int]) -> int:

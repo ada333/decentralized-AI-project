@@ -8,3 +8,6 @@ configs/
 __pycache__/
 *.pyc
 *.pyo
+
+# Tests - just for now
+tests/

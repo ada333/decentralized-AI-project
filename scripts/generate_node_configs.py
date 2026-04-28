@@ -12,10 +12,19 @@ import os
 import tomllib
 
 SHARDS_DIR = "./models/smollm-135m-shards"
-NUM_NODES = 3
+NUM_NODES = 1
 OUTPUT_DIR = "./configs"
-HOST = "127.0.0.1"
 BASE_PORT = 8765
+
+# For local testing (all on one machine):
+HOSTS = ["192.168.0.124"] * NUM_NODES
+
+# For multi-device testing, replace with actual IPs:
+# HOSTS = [
+#     "192.168.1.100",  # Node 0 - your machine
+#     "192.168.1.101",  # Node 1 - second device
+#     "192.168.1.102",  # Node 2 - third device
+# ]
 
 
 def assign_layers(num_layers: int, num_nodes: int) -> list[tuple[int, int]]:
@@ -45,6 +54,7 @@ def generate_configs():
 
     for i, (layer_start, layer_end) in enumerate(assignments):
         name = f"node_{i}"
+        host = HOSTS[i]
         port = BASE_PORT + i
         config_path = os.path.join(OUTPUT_DIR, f"{name}.toml")
 
@@ -53,7 +63,7 @@ def generate_configs():
             f.write(f'name = "{name}"\n')
             f.write(f'\n')
             f.write(f'[network]\n')
-            f.write(f'host = "{HOST}"\n')
+            f.write(f'host = "{host}"\n')
             f.write(f'port = {port}\n')
             f.write(f'\n')
             f.write(f'[model]\n')
@@ -61,7 +71,7 @@ def generate_configs():
             f.write(f'layer_start = {layer_start}\n')
             f.write(f'layer_end = {layer_end}\n')
 
-        print(f"  {name}: layers [{layer_start}, {layer_end}) on {HOST}:{port} -> {config_path}")
+        print(f"  {name}: layers [{layer_start}, {layer_end}) on {host}:{port} -> {config_path}")
 
     print(f"\nGenerated {NUM_NODES} config files in {OUTPUT_DIR}")
 
