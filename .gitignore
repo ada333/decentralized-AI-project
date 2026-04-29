@@ -8,6 +8,7 @@ configs/
 __pycache__/
 *.pyc
 *.pyo
+*.egg-info/
 
 # Tests - just for now
 tests/
