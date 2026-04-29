@@ -1,19 +1,26 @@
 import asyncio
-import torch
+
 import structlog
+import torch
 
 from model.model import Model
-from network.tensor_wire import serialize_tensors, deserialize_tensors, send_message, receive_message
+from network.tensor_wire import (
+    deserialize_tensors,
+    receive_message,
+    send_message,
+    serialize_tensors,
+)
 
 log = structlog.get_logger()
 
 
 class Pipeline:
     """Coordinates distributed text generation by routing hidden states through remote nodes.
-    
+
     Owns the tokenizer and model head components. Drives the generation loop: tokenize prompt,
     embed, forward through nodes, apply LM head, sample, repeat.
     """
+
     def __init__(self, model: Model, nodes_addresses: list[tuple[str, int]]):
         self.model = model
         self.nodes_addresses = nodes_addresses
@@ -63,9 +70,7 @@ class Pipeline:
         """Embed tokens, forward through nodes, and sample next token."""
         hidden_states = self.model.embed(token_ids)
         position_embeddings = self.model.get_position_embeddings(len(token_ids))
-        hidden_states = await self._forward_through_nodes(
-            hidden_states, position_embeddings
-        )
+        hidden_states = await self._forward_through_nodes(hidden_states, position_embeddings)
         logits = self.model.apply_lm_head(hidden_states)
         return self.model.sample(logits)
 

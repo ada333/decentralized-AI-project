@@ -14,6 +14,7 @@ Usage:
 
 import argparse
 import os
+
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -72,8 +73,12 @@ def split_model(model_path: str, output_dir: str):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Split a model into per-layer shards")
-    parser.add_argument("--model", type=str, required=True, help="HuggingFace model name or local path")
-    parser.add_argument("--output", type=str, required=True, help="Output directory for shard files")
+    parser.add_argument(
+        "--model", type=str, required=True, help="HuggingFace model name or local path"
+    )
+    parser.add_argument(
+        "--output", type=str, required=True, help="Output directory for shard files"
+    )
     args = parser.parse_args()
 
     split_model(args.model, args.output)

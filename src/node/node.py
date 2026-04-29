@@ -1,21 +1,28 @@
 import asyncio
 import os
+
+import structlog
 import torch
 import torch.nn as nn
 from transformers import AutoConfig
-from transformers.models.llama.modeling_llama import LlamaDecoderLayer
 from transformers.cache_utils import DynamicCache
-import structlog
+from transformers.models.llama.modeling_llama import LlamaDecoderLayer
 
-from network.tensor_wire import serialize_tensors, deserialize_tensors, send_message, receive_message
+from network.tensor_wire import (
+    deserialize_tensors,
+    receive_message,
+    send_message,
+    serialize_tensors,
+)
 
 
 class Node:
     """A worker in the distributed inference pipeline.
-    
+
     Holds a contiguous range of transformer layers and runs forward passes on hidden
     states received from the Pipeline. Maintains a KV cache for its layers across tokens.
     """
+
     layer_start: int
     layer_end: int
     layers: list[nn.Module]
@@ -68,14 +75,15 @@ class Node:
             self.log.debug("layer_loaded", layer_idx=i)
         self.log.info("layers_loaded", count=len(self.layers))
 
-
     async def start(self):
         """Start TCP server and listen for a connection from the Pipeline."""
         self.log.info("server_starting")
         self.load_layers()
         try:
             server = await asyncio.start_server(
-                self._on_connect, self.host, self.port,
+                self._on_connect,
+                self.host,
+                self.port,
             )
         except OSError as e:
             self.log.error("server_bind_failed", error=str(e))
@@ -83,7 +91,6 @@ class Node:
         self.log.info("server_listening")
         async with server:
             await server.serve_forever()
-
 
     async def _on_connect(
         self,
@@ -94,7 +101,7 @@ class Node:
         peer = writer.get_extra_info("peername")
         self.log.info("client_connected", peer=peer)
         self.kv_cache = DynamicCache()  # Reset cache for new session
-        
+
         try:
             while True:
                 data = await receive_message(reader)
@@ -110,7 +117,6 @@ class Node:
         finally:
             writer.close()
             await writer.wait_closed()
-
 
     def forward(
         self,

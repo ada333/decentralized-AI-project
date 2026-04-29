@@ -24,9 +24,7 @@ def main():
         required=True,
         help="Comma-separated paths to node config files",
     )
-    parser.add_argument(
-        "--max-tokens", type=int, default=50, help="Max tokens to generate"
-    )
+    parser.add_argument("--max-tokens", type=int, default=50, help="Max tokens to generate")
     args = parser.parse_args()
 
     config_paths = args.configs.split(",")

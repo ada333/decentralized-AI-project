@@ -1,14 +1,17 @@
 import os
+
+import structlog
 import torch
 import torch.nn as nn
-import structlog
 from transformers import AutoConfig, AutoTokenizer
 from transformers.models.llama.modeling_llama import LlamaRMSNorm, LlamaRotaryEmbedding
 
 log = structlog.get_logger()
+
+
 class Model:
     """The Pipeline's view of the model: tokenizer, embedding, LM head, and position embeddings.
-    
+
     Nodes only hold transformer layers. This class holds everything else needed to
     convert text to tokens, tokens to hidden states, and hidden states back to tokens.
     """
@@ -28,7 +31,7 @@ class Model:
         """Load tokenizer and pipeline head components (embedding, lm_head, norm, rotary_emb)."""
         log.info("loading_model", shards_dir=self.shards_dir)
         tokenizer_dir = os.path.join(self.shards_dir, "tokenizer")
-        
+
         try:
             self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_dir)
         except Exception as e:

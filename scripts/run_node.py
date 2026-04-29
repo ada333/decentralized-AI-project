@@ -31,7 +31,9 @@ def main():
         port=config["network"]["port"],
     )
 
-    print(f"Starting {config['node']['name']} on {node.host}:{node.port} (layers {node.layer_start}-{node.layer_end})")
+    print(
+        f"Starting {config['node']['name']} on {node.host}:{node.port} (layers {node.layer_start}-{node.layer_end})"
+    )
     asyncio.run(node.start())
 
 

@@ -59,17 +59,17 @@ def generate_configs():
         config_path = os.path.join(OUTPUT_DIR, f"{name}.toml")
 
         with open(config_path, "w") as f:
-            f.write(f'[node]\n')
+            f.write("[node]\n")
             f.write(f'name = "{name}"\n')
-            f.write(f'\n')
-            f.write(f'[network]\n')
+            f.write("\n")
+            f.write("[network]\n")
             f.write(f'host = "{host}"\n')
-            f.write(f'port = {port}\n')
-            f.write(f'\n')
-            f.write(f'[model]\n')
+            f.write(f"port = {port}\n")
+            f.write("\n")
+            f.write("[model]\n")
             f.write(f'shards_dir = "{SHARDS_DIR}"\n')
-            f.write(f'layer_start = {layer_start}\n')
-            f.write(f'layer_end = {layer_end}\n')
+            f.write(f"layer_start = {layer_start}\n")
+            f.write(f"layer_end = {layer_end}\n")
 
         print(f"  {name}: layers [{layer_start}, {layer_end}) on {host}:{port} -> {config_path}")
 

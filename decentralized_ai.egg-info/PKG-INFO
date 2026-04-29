@@ -1,0 +1,21 @@
+Metadata-Version: 2.4
+Name: decentralized-ai
+Version: 0.1.0
+Summary: A peer-to-peer system for collaborative LLM inference
+Requires-Python: >=3.11
+Description-Content-Type: text/markdown
+Requires-Dist: torch>=2.0
+Requires-Dist: transformers>=4.30
+Requires-Dist: structlog>=23.0
+Requires-Dist: msgpack>=1.0
+Requires-Dist: aiosqlite>=0.19
+Provides-Extra: dev
+Requires-Dist: pytest>=7.0; extra == "dev"
+Requires-Dist: pytest-asyncio>=0.21; extra == "dev"
+Requires-Dist: ruff>=0.4; extra == "dev"
+
+# Decentralized-AI-project
+I would like to build a decentralized AI project - decentralized inference (distributing token generation across nodes).
+It will be aimed for very small models. I just think it is cool and I would like to learn how it works more deeply and think about this problem - and what better way than trying out some simplified version on my own.
+
+(better README will be added after further functionality)

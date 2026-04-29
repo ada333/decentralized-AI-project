@@ -6,8 +6,9 @@ Shared by both Pipeline and Node for sending/receiving tensors over TCP.
 import asyncio
 import io
 import struct
-import torch
+
 import structlog
+import torch
 
 log = structlog.get_logger()
 
