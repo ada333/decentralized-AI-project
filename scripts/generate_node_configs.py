@@ -8,23 +8,16 @@ Usage:
   python scripts/generate_node_configs.py
 """
 
+# THIS SCRIPT IS USED IN THE INTEGRATION TESTS - ANY CHANGE CAN AFFECT THE TESTS
+
 import os
 import tomllib
 
-SHARDS_DIR = "./models/smollm-135m-shards"
-NUM_NODES = 1
-OUTPUT_DIR = "./configs"
-BASE_PORT = 8765
-
-# For local testing (all on one machine):
-HOSTS = ["192.168.0.124"] * NUM_NODES
-
-# For multi-device testing, replace with actual IPs:
-# HOSTS = [
-#     "192.168.1.100",  # Node 0 - your machine
-#     "192.168.1.101",  # Node 1 - second device
-#     "192.168.1.102",  # Node 2 - third device
-# ]
+DEFAULT_SHARDS_DIR = "./models/smollm-135m-shards"
+DEFAULT_NUM_NODES = 3
+DEFAULT_OUTPUT_DIR = "./configs"
+DEFAULT_BASE_PORT = 8765
+DEFAULT_HOST = "127.0.0.1"
 
 
 def assign_layers(num_layers: int, num_nodes: int) -> list[tuple[int, int]]:
@@ -43,20 +36,27 @@ def assign_layers(num_layers: int, num_nodes: int) -> list[tuple[int, int]]:
     return assignments
 
 
-def generate_configs():
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
+def generate_configs(
+    shards_dir: str = DEFAULT_SHARDS_DIR,
+    num_nodes: int = DEFAULT_NUM_NODES,
+    output_dir: str = DEFAULT_OUTPUT_DIR,
+    base_port: int = DEFAULT_BASE_PORT,
+    host: str = DEFAULT_HOST,
+) -> list[str]:
+    """Generate config files and return list of config paths."""
+    os.makedirs(output_dir, exist_ok=True)
 
-    with open(os.path.join(SHARDS_DIR, "model_info.toml"), "rb") as f:
+    with open(os.path.join(shards_dir, "model_info.toml"), "rb") as f:
         model_info = tomllib.load(f)
     num_layers = model_info["num_layers"]
 
-    assignments = assign_layers(num_layers, NUM_NODES)
+    assignments = assign_layers(num_layers, num_nodes)
+    config_paths = []
 
     for i, (layer_start, layer_end) in enumerate(assignments):
         name = f"node_{i}"
-        host = HOSTS[i]
-        port = BASE_PORT + i
-        config_path = os.path.join(OUTPUT_DIR, f"{name}.toml")
+        port = base_port + i
+        config_path = os.path.join(output_dir, f"{name}.toml")
 
         with open(config_path, "w") as f:
             f.write("[node]\n")
@@ -67,14 +67,16 @@ def generate_configs():
             f.write(f"port = {port}\n")
             f.write("\n")
             f.write("[model]\n")
-            f.write(f'shards_dir = "{SHARDS_DIR}"\n')
+            f.write(f'shards_dir = "{os.path.abspath(shards_dir)}"\n')
             f.write(f"layer_start = {layer_start}\n")
             f.write(f"layer_end = {layer_end}\n")
 
-        print(f"  {name}: layers [{layer_start}, {layer_end}) on {host}:{port} -> {config_path}")
+        config_paths.append(config_path)
+        print(f"  {name}: layers [{layer_start}, {layer_end}) on {host}:{port}")
 
-    print(f"\nGenerated {NUM_NODES} config files in {OUTPUT_DIR}")
+    return config_paths
 
 
 if __name__ == "__main__":
-    generate_configs()
+    configs = generate_configs()
+    print(f"\nGenerated {len(configs)} config files in {DEFAULT_OUTPUT_DIR}")

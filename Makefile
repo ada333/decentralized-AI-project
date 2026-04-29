@@ -1,7 +1,10 @@
-.PHONY: test lint format check
+.PHONY: test test-cluster lint format check
 
 test:
-	pytest src/tests
+	pytest src/tests/unit
+
+test-integration:
+	python src/tests/integration/test_local_cluster.py
 
 lint:
 	ruff check --fix .

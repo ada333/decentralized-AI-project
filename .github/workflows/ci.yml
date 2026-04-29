@@ -22,7 +22,6 @@ jobs:
 
       - name: Check formatting
         run: make check
-
   # test:
   #   runs-on: ubuntu-latest
   #   steps:
