@@ -1,9 +1,20 @@
 #!/usr/bin/env python3
+
 """
 Spin up a local 3-node cluster and verify end-to-end generation works.
 
 Usage:
   python src/tests/integration/test_local_cluster.py
+
+this test cant be run in CI because it requires a local model to be split
+and the model is not included in the repository.
+
+To run this test, you need to:
+1. Split the model using the scripts/split_model.py script
+2. Run the test using the python src/tests/integration/test_local_cluster.py command
+
+This test will spin up a local 3-node cluster and verify end-to-end generation works.
+
 """
 
 import asyncio

@@ -21,12 +21,20 @@ class Node:
 
     Holds a contiguous range of transformer layers and runs forward passes on hidden
     states received from the Pipeline. Maintains a KV cache for its layers across tokens.
+
+    Args:
+        shards_dir: Path to directory containing model shards (layer_X.pt files,
+            pipeline_head.pt, and tokenizer/).
+        layer_start: First layer index this node is responsible for (inclusive).
+        layer_end: Last layer index this node is responsible for (exclusive).
+        host: IP address to bind the TCP server to.
+        port: Port number to listen on for Pipeline connections.
     """
 
     layer_start: int
     layer_end: int
     layers: list[nn.Module]
-    kv_cache: DynamicCache
+    kv_caches: dict[int, DynamicCache]
     host: str
     port: int
 
@@ -35,7 +43,7 @@ class Node:
         self.layer_start = layer_start
         self.layer_end = layer_end
         self.layers: list[nn.Module] = []
-        self.kv_cache = DynamicCache()
+        self.kv_caches = {}
         self.host = host
         self.port = port
         self.log = structlog.get_logger().bind(
@@ -123,7 +131,16 @@ class Node:
         hidden_states: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
     ) -> torch.Tensor:
-        """Forward pass through this node's layers."""
+        """Forward pass through this node's layers.
+
+        Args:
+            hidden_states: Input tensor of shape [batch, seq_len, hidden_dim].
+            position_embeddings: Tuple of (cos, sin) rotary embeddings, each
+                of shape [batch, seq_len, hidden_dim].
+
+        Returns:
+            Output hidden states after passing through all layers, same shape as input.
+        """
         for layer in self.layers:
             layer_output = layer(
                 hidden_states,

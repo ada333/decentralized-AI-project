@@ -19,6 +19,11 @@ class Pipeline:
 
     Owns the tokenizer and model head components. Drives the generation loop: tokenize prompt,
     embed, forward through nodes, apply LM head, sample, repeat.
+
+    Args:
+        model: Model instance containing tokenizer, embedding layer, and LM head.
+        nodes_addresses: Ordered list of (host, port) tuples for each node in the pipeline.
+            Nodes are contacted in order — first node should have the earliest layers.
     """
 
     def __init__(self, model: Model, nodes_addresses: list[tuple[str, int]]):
@@ -52,7 +57,15 @@ class Pipeline:
         hidden_states: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
     ) -> torch.Tensor:
-        """Send hidden states through all nodes and return the final output."""
+        """Send hidden states through all nodes and return the final output.
+
+        Args:
+            hidden_states: Tensor of shape [batch, seq_len, hidden_dim].
+            position_embeddings: Tuple of (cos, sin) rotary embeddings.
+
+        Returns:
+            Hidden states after passing through all nodes' layers.
+        """
         data = serialize_tensors(hidden_states, position_embeddings)
 
         for i, (reader, writer) in enumerate(self._connections):
@@ -67,7 +80,15 @@ class Pipeline:
         return hidden_states
 
     async def _generate_next_token(self, token_ids: list[int]) -> int:
-        """Embed tokens, forward through nodes, and sample next token."""
+        """Embed tokens, forward through nodes, and sample next token.
+
+        Args:
+            token_ids: List of token IDs to process. For the initial prompt this is
+                all tokens; for subsequent steps it's just the previously generated token.
+
+        Returns:
+            The sampled next token ID.
+        """
         hidden_states = self.model.embed(token_ids)
         position_embeddings = self.model.get_position_embeddings(len(token_ids))
         hidden_states = await self._forward_through_nodes(hidden_states, position_embeddings)
@@ -76,7 +97,16 @@ class Pipeline:
 
     @torch.no_grad()
     async def generate(self, prompt: str, max_new_tokens: int = 50) -> str:
-        """Generate text for a single prompt by distributing inference across nodes."""
+        """Generate text for a single prompt by distributing inference across nodes.
+
+        Args:
+            prompt: Input text to continue from.
+            max_new_tokens: Maximum number of tokens to generate. Generation stops
+                early if the model produces an EOS token.
+
+        Returns:
+            The generated text (excluding the original prompt).
+        """
         log.info("generation_start", prompt_length=len(prompt), max_new_tokens=max_new_tokens)
         self.model.reset_position()
         await self._connect_to_nodes()
