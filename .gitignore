@@ -10,5 +10,3 @@ __pycache__/
 *.pyo
 *.egg-info/
 
-# Tests - just for now
-src/tests/unit/
