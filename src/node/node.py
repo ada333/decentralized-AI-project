@@ -108,16 +108,30 @@ class Node:
         """Called when the Pipeline connects. Runs a request loop."""
         peer = writer.get_extra_info("peername")
         self.log.info("client_connected", peer=peer)
-        self.kv_cache = DynamicCache()  # Reset cache for new session
 
         try:
             while True:
-                data = await receive_message(reader)
+                session_id, data = await receive_message(reader)
                 hidden_states, position_embeddings = deserialize_tensors(data)
-                self.log.debug("forward_start", input_shape=list(hidden_states.shape))
-                hidden_states = self.forward(hidden_states, position_embeddings)
-                self.log.debug("forward_done", output_shape=list(hidden_states.shape))
-                await send_message(writer, serialize_tensors(hidden_states, position_embeddings))
+
+                if session_id not in self.kv_caches:
+                    self.kv_caches[session_id] = DynamicCache()
+                    self.log.debug("session_created", session_id=session_id.hex())
+
+                self.log.debug(
+                    "forward_start",
+                    session_id=session_id.hex(),
+                    input_shape=list(hidden_states.shape),
+                )
+                hidden_states = self.forward(session_id, hidden_states, position_embeddings)
+                self.log.debug(
+                    "forward_done",
+                    session_id=session_id.hex(),
+                    output_shape=list(hidden_states.shape),
+                )
+                await send_message(
+                    writer, session_id, serialize_tensors(hidden_states, position_embeddings)
+                )
         except asyncio.IncompleteReadError:
             self.log.info("client_disconnected", peer=peer)
         except Exception as e:
@@ -128,12 +142,14 @@ class Node:
 
     def forward(
         self,
+        session_id: bytes,
         hidden_states: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
     ) -> torch.Tensor:
         """Forward pass through this node's layers.
 
         Args:
+            session_id: 4-byte session identifier for KV cache lookup.
             hidden_states: Input tensor of shape [batch, seq_len, hidden_dim].
             position_embeddings: Tuple of (cos, sin) rotary embeddings, each
                 of shape [batch, seq_len, hidden_dim].
@@ -141,15 +157,13 @@ class Node:
         Returns:
             Output hidden states after passing through all layers, same shape as input.
         """
+        kv_cache = self.kv_caches[session_id]
         for layer in self.layers:
             layer_output = layer(
                 hidden_states,
-                past_key_values=self.kv_cache,
+                past_key_values=kv_cache,
                 use_cache=True,
                 position_embeddings=position_embeddings,
             )
-            # HF layer return type can vary by version:
-            # - torch.Tensor
-            # - tuple where index 0 is hidden_states
             hidden_states = layer_output[0] if isinstance(layer_output, tuple) else layer_output
         return hidden_states

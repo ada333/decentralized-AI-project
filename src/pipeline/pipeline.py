@@ -1,4 +1,5 @@
 import asyncio
+import os
 
 import structlog
 import torch
@@ -54,12 +55,14 @@ class Pipeline:
 
     async def _forward_through_nodes(
         self,
+        session_id: bytes,
         hidden_states: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
     ) -> torch.Tensor:
         """Send hidden states through all nodes and return the final output.
 
         Args:
+            session_id: 4-byte session identifier for KV cache lookup.
             hidden_states: Tensor of shape [batch, seq_len, hidden_dim].
             position_embeddings: Tuple of (cos, sin) rotary embeddings.
 
@@ -70,8 +73,8 @@ class Pipeline:
 
         for i, (reader, writer) in enumerate(self._connections):
             try:
-                await send_message(writer, data)
-                data = await receive_message(reader)
+                await send_message(writer, session_id, data)
+                _, data = await receive_message(reader)
             except (OSError, asyncio.IncompleteReadError) as e:
                 log.error("node_communication_failed", node_index=i, error=str(e))
                 raise
@@ -79,10 +82,11 @@ class Pipeline:
         hidden_states, _ = deserialize_tensors(data)
         return hidden_states
 
-    async def _generate_next_token(self, token_ids: list[int]) -> int:
+    async def _generate_next_token(self, session_id: bytes, token_ids: list[int]) -> int:
         """Embed tokens, forward through nodes, and sample next token.
 
         Args:
+            session_id: 4-byte session identifier for KV cache lookup.
             token_ids: List of token IDs to process. For the initial prompt this is
                 all tokens; for subsequent steps it's just the previously generated token.
 
@@ -91,7 +95,9 @@ class Pipeline:
         """
         hidden_states = self.model.embed(token_ids)
         position_embeddings = self.model.get_position_embeddings(len(token_ids))
-        hidden_states = await self._forward_through_nodes(hidden_states, position_embeddings)
+        hidden_states = await self._forward_through_nodes(
+            session_id, hidden_states, position_embeddings
+        )
         logits = self.model.apply_lm_head(hidden_states)
         return self.model.sample(logits)
 
@@ -107,14 +113,20 @@ class Pipeline:
         Returns:
             The generated text (excluding the original prompt).
         """
-        log.info("generation_start", prompt_length=len(prompt), max_new_tokens=max_new_tokens)
+        session_id = os.urandom(4)
+        log.info(
+            "generation_start",
+            session_id=session_id.hex(),
+            prompt_length=len(prompt),
+            max_new_tokens=max_new_tokens,
+        )
         self.model.reset_position()
         await self._connect_to_nodes()
 
         try:
             token_ids = self.model.tokenize(prompt)
             log.debug("prompt_tokenized", num_tokens=len(token_ids))
-            next_token = await self._generate_next_token(token_ids)
+            next_token = await self._generate_next_token(session_id, token_ids)
 
             if next_token == self.model.eos_token_id:
                 log.info("generation_complete", tokens_generated=0, reason="eos_immediate")
@@ -123,7 +135,7 @@ class Pipeline:
             generated = [next_token]
 
             for _ in range(max_new_tokens - 1):
-                next_token = await self._generate_next_token([next_token])
+                next_token = await self._generate_next_token(session_id, [next_token])
 
                 if next_token == self.model.eos_token_id:
                     break
