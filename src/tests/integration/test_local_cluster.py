@@ -25,15 +25,14 @@ import sys
 import tempfile
 import time
 
-from generate_node_configs import generate_configs
-from model.model import Model
-from pipeline.pipeline import Pipeline
-
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, "..", "..", ".."))
 sys.path.insert(0, os.path.join(PROJECT_ROOT, "src"))
 sys.path.insert(0, os.path.join(PROJECT_ROOT, "scripts"))
 
+from generate_node_configs import generate_configs  # noqa: E402
+from model.model import Model  # noqa: E402
+from pipeline.pipeline import Pipeline  # noqa: E402
 
 SHARDS_DIR = os.path.join(PROJECT_ROOT, "models", "smollm-135m-shards")
 NUM_NODES = 3
