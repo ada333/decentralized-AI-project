@@ -88,7 +88,7 @@ class NodeGroup:
             raise ValueError(f"Cannot create NodeGroup: {e}") from e
         self.group_id = group_id
         self.nodes: list[NodeInfo] = []
-        self.next_group: "NodeGroup" | None = None
+        self.next_group: NodeGroup | None = None
 
     @property
     def layer_range(self) -> tuple[int, int]:
