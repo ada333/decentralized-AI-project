@@ -8,53 +8,81 @@ import pytest
 import torch
 
 from network.tensor_wire import serialize_tensors
+from node.coordinator import PipelineCoordinator
+from node.node_group import NodeInfo, SelectionStrategy
 from pipeline.pipeline import Pipeline
 
 
 def test_pipeline_init(mock_model):
-    """Pipeline constructor sets model and nodes."""
-    nodes = [("127.0.0.1", 8000), ("127.0.0.1", 8001)]
-    pipeline = Pipeline(model=mock_model, nodes_addresses=nodes)
+    """Pipeline constructor sets model and coordinator."""
+    coordinator = PipelineCoordinator()
+    coordinator.register_node(NodeInfo("node1", "127.0.0.1", 8000, group_id=0))
+    coordinator.register_node(NodeInfo("node2", "127.0.0.1", 8001, group_id=1))
+
+    pipeline = Pipeline(model=mock_model, coordinator=coordinator)
 
     assert pipeline.model is mock_model
-    assert pipeline.nodes_addresses == nodes
-    assert pipeline._connections == []
+    assert pipeline.coordinator is coordinator
+    assert pipeline.selection_strategy == SelectionStrategy.ROUND_ROBIN
 
 
 @pytest.mark.asyncio
 async def test_connect_to_nodes(mock_model):
     """_connect_to_nodes opens TCP connection to each node."""
-    nodes = [("127.0.0.1", 8000), ("127.0.0.1", 8001)]
-    pipeline = Pipeline(mock_model, nodes)
+    coordinator = PipelineCoordinator()
+    coordinator.register_node(NodeInfo("node1", "127.0.0.1", 8000, group_id=0))
+    coordinator.register_node(NodeInfo("node2", "127.0.0.1", 8001, group_id=1))
+
+    pipeline = Pipeline(mock_model, coordinator)
 
     with patch("asyncio.open_connection", new_callable=AsyncMock) as mock_open:
         mock_open.return_value = (MagicMock(), MagicMock())
         await pipeline._connect_to_nodes()
 
-    assert len(pipeline._connections) == 2
+    # Check that connections were stored in NodeInfo objects
+    all_groups = coordinator.get_all_groups()
+    for group in all_groups:
+        for node in group.nodes:
+            assert node.reader is not None
+            assert node.writer is not None
+
     assert mock_open.call_count == 2
 
 
 @pytest.mark.asyncio
 async def test_close_connections(mock_model):
     """_close_connections closes all writers."""
-    pipeline = Pipeline(mock_model, [])
+    coordinator = PipelineCoordinator()
+    node1 = NodeInfo("node1", "127.0.0.1", 8000, group_id=0)
+    node2 = NodeInfo("node2", "127.0.0.1", 8001, group_id=1)
 
-    for _ in range(2):
+    # Attach mock connections
+    for node in [node1, node2]:
         writer = MagicMock()
         writer.close = MagicMock()
         writer.wait_closed = AsyncMock()
-        pipeline._connections.append((MagicMock(), writer))
+        node.reader = MagicMock()
+        node.writer = writer
 
+    coordinator.register_node(node1)
+    coordinator.register_node(node2)
+
+    pipeline = Pipeline(mock_model, coordinator)
     await pipeline._close_connections()
 
-    assert pipeline._connections == []
+    # Verify all connections were closed
+    for group in coordinator.get_all_groups():
+        for node in group.nodes:
+            assert node.reader is None
+            assert node.writer is None
 
 
 @pytest.mark.asyncio
 async def test_forward_through_nodes_with_session_id(mock_model):
     """_forward_through_nodes sends session ID with data."""
-    pipeline = Pipeline(mock_model, [])
+    coordinator = PipelineCoordinator()
+    node1 = NodeInfo("node1", "127.0.0.1", 8000, group_id=0)
+
     session_id = b"\xaa\xbb\xcc\xdd"
 
     reader = asyncio.StreamReader()
@@ -70,7 +98,11 @@ async def test_forward_through_nodes_with_session_id(mock_model):
     writer.write = MagicMock()
     writer.drain = AsyncMock()
 
-    pipeline._connections = [(reader, writer)]
+    node1.reader = reader
+    node1.writer = writer
+
+    coordinator.register_node(node1)
+    pipeline = Pipeline(mock_model, coordinator)
 
     hidden = torch.randn(1, 3, 576)
     result = await pipeline._forward_through_nodes(session_id, hidden, pos_emb)
@@ -82,7 +114,8 @@ async def test_forward_through_nodes_with_session_id(mock_model):
 @pytest.mark.asyncio
 async def test_generate_stops_on_eos(mock_model):
     """generate() stops when EOS token is generated."""
-    pipeline = Pipeline(mock_model, [])
+    coordinator = PipelineCoordinator()
+    pipeline = Pipeline(mock_model, coordinator)
 
     pipeline._connect_to_nodes = AsyncMock()
     pipeline._close_connections = AsyncMock()
@@ -106,7 +139,8 @@ async def test_generate_stops_on_eos(mock_model):
 @pytest.mark.asyncio
 async def test_generate_returns_detokenized_text(mock_model):
     """generate() returns detokenized generated tokens."""
-    pipeline = Pipeline(mock_model, [])
+    coordinator = PipelineCoordinator()
+    pipeline = Pipeline(mock_model, coordinator)
 
     pipeline._connect_to_nodes = AsyncMock()
     pipeline._close_connections = AsyncMock()

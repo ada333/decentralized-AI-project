@@ -34,6 +34,8 @@ sys.path.insert(0, os.path.join(PROJECT_ROOT, "scripts"))
 
 from generate_node_configs import generate_configs  # noqa: E402
 from model.model import Model  # noqa: E402
+from node.coordinator import PipelineCoordinator  # noqa: E402
+from node.node_group import NodeInfo  # noqa: E402
 from pipeline.pipeline import Pipeline  # noqa: E402
 
 SHARDS_DIR = os.path.join(PROJECT_ROOT, "models", "smollm-135m-shards")
@@ -125,8 +127,21 @@ async def run_generation(prompt: str, max_tokens: int = MAX_TOKENS) -> tuple[str
     """Run generation through the pipeline. Returns (text, token_count)."""
     model = Model(SHARDS_DIR)
     model.load()
-    nodes = [("127.0.0.1", BASE_PORT + i) for i in range(NUM_NODES)]
-    pipeline = Pipeline(model, nodes)
+
+    # Create coordinator and register nodes
+    # For SmolLM-135M with 3 nodes, we use predefined groups 0, 1, 2
+    # Group 0: layers 0-10, Group 1: layers 10-20, Group 2: layers 20-30
+    coordinator = PipelineCoordinator()
+    for i in range(NUM_NODES):
+        node_info = NodeInfo(
+            node_id=f"node_{i}",
+            host="127.0.0.1",
+            port=BASE_PORT + i,
+            group_id=i,  # Maps to predefined groups 0, 1, 2
+        )
+        coordinator.register_node(node_info)
+
+    pipeline = Pipeline(model, coordinator)
     result = await pipeline.generate(prompt, max_tokens)
     token_count = len(model.tokenize(result)) if result else 0
     return result, token_count

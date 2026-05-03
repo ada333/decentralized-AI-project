@@ -101,8 +101,11 @@ decentralized-AI-project/
 │   ├── model/             # Pipeline's model components
 │   │   └── model.py       # Model class: tokenizer, embedding, LM head, rotary emb
 │   │
-│   ├── node/              # Worker nodes
-│   │   └── node.py        # Node class: loads layers, runs forward, manages KV cache
+│   ├── node/              # Node management and grouping
+│   │   ├── node.py        # Node class: loads layers, runs forward, manages KV cache
+│   │   ├── node_group.py  # NodeGroup and NodeInfo: redundancy/load balancing
+│   │   ├── coordinator.py # PipelineCoordinator: manages node groups
+│   │   └── layer_groups.py # Predefined layer group definitions
 │   │
 │   └── pipeline/          # Coordinator
 │       └── pipeline.py    # Pipeline class: drives generation, routes tensors
@@ -175,6 +178,26 @@ Important details:
 - Layer norm / final norm placement depends on the architecture
 - Each shard is a standalone `nn.Module` that takes hidden states in and produces hidden states out
 - Shards are saved/loaded independently so nodes only download what they need
+
+#### Layer Groups
+
+Instead of using arbitrary `(start_layer, end_layer)` tuples, the system uses **predefined layer groups** defined in `src/node/layer_groups.py`. For SmolLM-135M with 30 layers:
+
+```python
+LAYER_GROUPS = {
+    0: LayerGroupConfig(group_id=0, start_layer=0, end_layer=10),   # Group 0: layers 0-9
+    1: LayerGroupConfig(group_id=1, start_layer=10, end_layer=20),  # Group 1: layers 10-19
+    2: LayerGroupConfig(group_id=2, start_layer=20, end_layer=30),  # Group 2: layers 20-29
+}
+```
+
+**Why predefined groups?**
+- **Consistency**: All nodes agree on group definitions — no mismatches from arbitrary ranges
+- **Simplicity**: Nodes specify `group_id=0` instead of `layer_range=(0, 10)`
+- **Validation**: NodeInfo validates group_id at creation, catching errors early
+- **Flexibility**: Easy to change group boundaries in one place for the entire system
+
+Nodes declare which group they belong to using `group_id`. The `NodeGroup` class groups all nodes handling the same `group_id`, providing redundancy and load balancing.
 
 ### 2. The Inference Pipeline
 
@@ -294,7 +317,21 @@ How nodes organize into a pipeline:
 
 **Phase 2 — Dynamic assignment**: Nodes advertise their capabilities (RAM, compute speed). A coordinator assigns layer ranges based on capacity. Nodes can join/leave and the pipeline reorganizes.
 
-**Phase 3 (stretch) — Redundancy**: Multiple nodes can hold the same layers. Requests get routed to the least-loaded replica. Provides fault tolerance.
+**Phase 3 — Redundancy (IMPLEMENTED)**: Multiple nodes can hold the same layers. The `PipelineCoordinator` groups nodes by layer range into `NodeGroup` instances. Each group manages all nodes handling that layer range. During inference, the Pipeline selects an available node from each group using a load balancing strategy (least_loaded, round_robin, first). This provides:
+- **Fault tolerance**: If one node crashes, route to another in the same group
+- **Load balancing**: Distribute concurrent requests across nodes
+- **Horizontal scaling**: Add more nodes to bottleneck layers
+
+Example topology with redundancy:
+```
+Group 0 (layers 0-9):   [Node A1, Node A2, Node A3]  ← 3 replicas
+                                   ↓
+Group 1 (layers 10-19): [Node B1, Node B2]           ← 2 replicas
+                                   ↓
+Group 2 (layers 20-29): [Node C1, Node C2, Node C3]  ← 3 replicas
+```
+
+The Pipeline walks through groups in order, selecting one node per group for each request. Nodes track `active_sessions` for load balancing.
 
 ### 4. P2P Networking
 
@@ -401,6 +438,88 @@ Not all nodes are equal. A Raspberry Pi and a gaming PC shouldn't get the same n
 - Compute speed (constrains tokens/sec per layer)
 - Network bandwidth to neighbors
 
+## Usage Examples
+
+### Setting up a Pipeline with Node Groups
+
+```python
+from model.model import Model
+from node.coordinator import PipelineCoordinator
+from node.node_group import NodeInfo, SelectionStrategy
+from pipeline.pipeline import Pipeline
+
+# Load the model (Pipeline owns tokenizer and LM head)
+model = Model("models/smollm-135m-shards")
+model.load()
+
+# Create coordinator
+coordinator = PipelineCoordinator()
+
+# Register nodes for group 0 (layers 0-10) - 3 replicas for redundancy
+coordinator.register_node(NodeInfo("node_a1", "192.168.1.10", 8765, group_id=0))
+coordinator.register_node(NodeInfo("node_a2", "192.168.1.11", 8765, group_id=0))
+coordinator.register_node(NodeInfo("node_a3", "192.168.1.12", 8765, group_id=0))
+
+# Register nodes for group 1 (layers 10-20) - 2 replicas
+coordinator.register_node(NodeInfo("node_b1", "192.168.1.13", 8765, group_id=1))
+coordinator.register_node(NodeInfo("node_b2", "192.168.1.14", 8765, group_id=1))
+
+# Register nodes for group 2 (layers 20-30)
+coordinator.register_node(NodeInfo("node_c1", "192.168.1.15", 8765, group_id=2))
+
+# Create pipeline with load balancing
+pipeline = Pipeline(model, coordinator, selection_strategy=SelectionStrategy.LEAST_LOADED)
+
+# Generate text
+result = await pipeline.generate("The future of AI is", max_new_tokens=50)
+print(result)
+```
+
+### Selection Strategies
+
+The Pipeline supports different node selection strategies:
+
+- **`least_loaded`** (default): Picks the node with the fewest active sessions. Best for load balancing.
+- **`round_robin`**: Random selection from available nodes. Simple but fair.
+- **`first`**: Always picks the first node in each group. Useful for debugging.
+
+```python
+# Use round-robin selection
+pipeline = Pipeline(model, coordinator, selection_strategy=SelectionStrategy.ROUND_ROBIN)
+
+# Use first-node (for debugging)
+pipeline = Pipeline(model, coordinator, selection_strategy=SelectionStrategy.FIRST)
+```
+
+### Dynamic Node Management
+
+Add or remove nodes at runtime:
+
+```python
+# Add a new node to an existing group
+new_node = NodeInfo("node_a4", "192.168.1.16", 8765, group_id=0)
+coordinator.register_node(new_node)
+
+# Remove a failed node
+coordinator.unregister_node("node_a1")
+
+# The pipeline will automatically use the updated topology
+```
+
+### Checking Pipeline Status
+
+```python
+# Get all groups in order
+for group in coordinator.get_all_groups():
+    print(f"Group {group.group_id} (layers {group.layer_range[0]}-{group.layer_range[1]}): {len(group.nodes)} nodes")
+    for node in group.nodes:
+        print(f"  - {node.node_id} at {node.host}:{node.port} ({node.active_sessions} active)")
+
+# Get the first group (where requests start)
+first = coordinator.get_first_group()
+print(f"Pipeline starts at group {first.group_id}: layers {first.layer_range[0]}-{first.layer_range[1]}")
+```
+
 ## Coding Conventions
 
 ### Python Style
@@ -447,8 +566,8 @@ Not all nodes are equal. A Raspberry Pi and a gaming PC shouldn't get the same n
 - [x] Generalize to N-node pipeline
 - [ ] Peer discovery (bootstrap list → gossip with layer advertisements)
 - [ ] Pipeline negotiation (nodes agree on who has which layers)
-- [ ] Multiple concurrent inference sessions
-- [ ] Local cluster test script (3+ nodes, full generation)
+- [x] Multiple concurrent inference sessions
+- [x] Local cluster test script (3+ nodes, full generation)
 
 ### Phase 4 — Performance
 - [ ] Activation compression (float16 → int8 quantization for transfer)
@@ -459,7 +578,7 @@ Not all nodes are equal. A Raspberry Pi and a gaming PC shouldn't get the same n
 ### Phase 5 — Robustness & Polish
 - [ ] Node failure detection and pipeline recovery
 - [ ] Dynamic layer reassignment when nodes join/leave
-- [ ] Load balancing across heterogeneous nodes
+- [x] Load balancing across heterogeneous nodes (NodeGroup + PipelineCoordinator with selection strategies)
 - [ ] Simple web UI or TUI for monitoring pipeline health and generating text
 - [ ] Model version handshake and consistency checks
 

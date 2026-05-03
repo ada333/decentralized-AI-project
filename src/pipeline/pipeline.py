@@ -11,6 +11,8 @@ from network.tensor_wire import (
     send_message,
     serialize_tensors,
 )
+from node.coordinator import PipelineCoordinator
+from node.node_group import SelectionStrategy
 
 log = structlog.get_logger()
 
@@ -21,37 +23,67 @@ class Pipeline:
     Owns the tokenizer and model head components. Drives the generation loop: tokenize prompt,
     embed, forward through nodes, apply LM head, sample, repeat.
 
+    Uses a PipelineCoordinator to manage node groups and enable load balancing / fault tolerance.
+
     Args:
         model: Model instance containing tokenizer, embedding layer, and LM head.
-        nodes_addresses: Ordered list of (host, port) tuples for each node in the pipeline.
-            Nodes are contacted in order — first node should have the earliest layers.
+        coordinator: PipelineCoordinator instance managing node groups.
+        selection_strategy: Node selection strategy (see SelectionStrategy enum).
     """
 
-    def __init__(self, model: Model, nodes_addresses: list[tuple[str, int]]):
+    def __init__(
+        self,
+        model: Model,
+        coordinator: PipelineCoordinator,
+        selection_strategy: SelectionStrategy = SelectionStrategy.ROUND_ROBIN,
+    ):
         self.model = model
-        self.nodes_addresses = nodes_addresses
-        self._connections: list[tuple[asyncio.StreamReader, asyncio.StreamWriter]] = []
+        self.coordinator = coordinator
+        self.selection_strategy = selection_strategy
 
     async def _connect_to_nodes(self):
-        """Open a TCP connection to each node."""
-        log.info("connecting_to_nodes", count=len(self.nodes_addresses))
-        for host, port in self.nodes_addresses:
-            try:
-                reader, writer = await asyncio.open_connection(host, port)
-            except OSError as e:
-                log.error("node_connection_failed", host=host, port=port, error=str(e))
-                raise
-            self._connections.append((reader, writer))
-            log.debug("node_connected", host=host, port=port)
+        """Open a TCP connection to each node in all groups."""
+        all_groups = self.coordinator.get_all_groups()
+        total_nodes = sum(len(group.nodes) for group in all_groups)
+        log.info("connecting_to_nodes", num_groups=len(all_groups), total_nodes=total_nodes)
+
+        for group in all_groups:
+            for node in group.nodes:
+                try:
+                    reader, writer = await asyncio.open_connection(node.host, node.port)
+                    node.reader = reader
+                    node.writer = writer
+                    log.debug(
+                        "node_connected",
+                        node_id=node.node_id,
+                        host=node.host,
+                        port=node.port,
+                        group_id=node.group_id,
+                    )
+                except OSError as e:
+                    log.error(
+                        "node_connection_failed",
+                        node_id=node.node_id,
+                        host=node.host,
+                        port=node.port,
+                        error=str(e),
+                    )
+                    raise
         log.info("all_nodes_connected")
 
     async def _close_connections(self):
         """Close all TCP connections."""
-        log.info("closing_connections", count=len(self._connections))
-        for _, writer in self._connections:
-            writer.close()
-            await writer.wait_closed()
-        self._connections = []
+        all_groups = self.coordinator.get_all_groups()
+        total_nodes = sum(len(group.nodes) for group in all_groups)
+        log.info("closing_connections", total_nodes=total_nodes)
+
+        for group in all_groups:
+            for node in group.nodes:
+                if node.writer:
+                    node.writer.close()
+                    await node.writer.wait_closed()
+                    node.reader = None
+                    node.writer = None
 
     async def _forward_through_nodes(
         self,
@@ -59,7 +91,10 @@ class Pipeline:
         hidden_states: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
     ) -> torch.Tensor:
-        """Send hidden states through all nodes and return the final output.
+        """Send hidden states through all node groups and return the final output.
+
+        For each group in the pipeline, selects an available node using the configured
+        strategy (least_loaded, round_robin, etc.) and routes the request through it.
 
         Args:
             session_id: 4-byte session identifier for KV cache lookup.
@@ -67,17 +102,38 @@ class Pipeline:
             position_embeddings: Tuple of (cos, sin) rotary embeddings.
 
         Returns:
-            Hidden states after passing through all nodes' layers.
+            Hidden states after passing through all groups' layers.
         """
         data = serialize_tensors(hidden_states, position_embeddings)
+        current_group = self.coordinator.get_first_group()
 
-        for i, (reader, writer) in enumerate(self._connections):
+        while current_group:
+            # Select a node from this group
+            node = current_group.get_available_node(strategy=self.selection_strategy)
+            node.active_sessions += 1
+
             try:
-                await send_message(writer, session_id, data)
-                _, data = await receive_message(reader)
+                await send_message(node.writer, session_id, data)
+                _, data = await receive_message(node.reader)
+                log.debug(
+                    "group_forward_complete",
+                    node_id=node.node_id,
+                    group_id=node.group_id,
+                    session_id=session_id.hex(),
+                )
             except (OSError, asyncio.IncompleteReadError) as e:
-                log.error("node_communication_failed", node_index=i, error=str(e))
+                log.error(
+                    "node_communication_failed",
+                    node_id=node.node_id,
+                    group_id=node.group_id,
+                    error=str(e),
+                )
                 raise
+            finally:
+                node.active_sessions -= 1
+
+            # Move to next group
+            current_group = current_group.next_group
 
         hidden_states, _ = deserialize_tensors(data)
         return hidden_states
